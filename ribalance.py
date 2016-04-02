@@ -1,3 +1,5 @@
+import argparse
+
 from pprint import pprint as pp
 from datetime import datetime, timedelta
 from collections import defaultdict as dd
@@ -140,6 +142,7 @@ class RegionalMap(object):
         changes = dd(lambda :dd(lambda: dd(lambda : [])))
         ideal_target = {}
         regional_situation = {}
+        mods = []
         for type_, instmap in self.instances.iteritems():
             target_configurations = []
             regional_type_situation = {}
@@ -196,12 +199,13 @@ class RegionalMap(object):
 
             # If asked to commit it, do it
             if commit:
-                if should_execute(changes[type_]):
-                    print self.ec2.modify_reserved_instances(
-                        client_token='123',
+                if should_execute(changes[type_]) and instmap["ri"].ids:
+                    client_token = datetime.utcnow().replace(second=0, microsecond=0).isoformat()
+                    mods.append((type_, self.ec2.modify_reserved_instances(
+                        client_token=client_token,
                         reserved_instance_ids=instmap["ri"].ids,
                         target_configurations=target_configurations
-                    )
+                    )))
                 else:
                     print "Skipping...", region, type_
 
@@ -223,18 +227,43 @@ class RegionalMap(object):
                     changes[type_][platform][zone].append("+R:%s" % len(new_suggested))
 
 
-        return changes, ideal_target, regional_situation
+        return changes, ideal_target, regional_situation, mods
 
 if __name__ == "__main__":
-    res_age = datetime.utcnow() - timedelta(weeks=1)
-    for region in ec2m.RegionData:
-        if region in ["cn-north-1", "us-gov-west-1"]:
-            continue
+    parser = argparse.ArgumentParser(description='ribalance will try to allocate your RIs in the most efficient way.',
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
+    dr = ec2m.RegionData.keys()
+    dr.remove('cn-north-1')
+    dr.remove('us-gov-west-1')
+
+    parser.add_argument('--regions', nargs='*', default=dr,
+                        choices=ec2m.RegionData.keys(), help='Regions to apply this')
+    parser.add_argument('--commit', action='store_true', help='Should apply changes') 
+    parser.add_argument('--changes', action='store_true', help='Display changes')
+    parser.add_argument('--target', action='store_true', help='Display target')
+    parser.add_argument('--state', action='store_true', help='Display state')
+    parser.add_argument('--age', type=int, default=168, help='Hours since launch to consider sustained (1wk default)')
+
+
+
+    args = parser.parse_args()
+
+    res_age = datetime.utcnow() - timedelta(hours=args.age)
+    for region in args.regions:
         print "=============  " + region + "  =============="
         rrimap = RegionalMap(region)
-        changes, targets, regional_situation = rrimap.ideal_target(res_age, True)
-        pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(changes).items()})
-        # pp({k: [conf_target_to_dict(i) for i in v] for k, v in targets.items()})
-        # pp(regional_situation)
+        changes, targets, regional_situation, mods = rrimap.ideal_target(res_age, args.commit)
+        if args.changes:
+            print "changes"
+            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(changes).items()})
+        if args.target:
+            print "targets"
+            pp({k: [conf_target_to_dict(i) for i in v] for k, v in targets.items()})
+        if args.state:
+            print "regional breakdown"
+            pp(regional_situation)
+        if args.commit:
+            print "RI Modifications"
+            pp(mods)
 
