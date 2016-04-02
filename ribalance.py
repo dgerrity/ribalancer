@@ -2,6 +2,7 @@ from pprint import pprint as pp
 from datetime import datetime, timedelta
 from collections import defaultdict as dd
 from boto import ec2 as ec2m
+from boto.ec2 import reservedinstance as rim
 
 class IL(object):
     """
@@ -39,58 +40,6 @@ class IL(object):
     def sort(self, key=None):
         self.l.sort(key=key)
 
-    def group_by_zone(self):
-        zones = dd(lambda : IL())
-        for i in self.l:
-            if hasattr(i, 'placement'):
-                zones[i.placement].append(i)
-            elif hasattr(i, 'availability_zone'):
-                zones[i.availability_zone].append(i)
-            else:
-                raise TypeError("unknown object type %s" % (type(i),))
-        return zones
-
-    def ids(self):
-        return [i.id for i in self.l]
-
-class RegionalMap(object):
-    """
-    This object represents the structure of a region in terms of instances,
-    spots and reserved instances
-    """
-
-    def __init__(self, region):
-        self.instances = dd(lambda: dd(lambda: dd(lambda : IL())))
-
-        ec2 = ec2m.connect_to_region(region)
-
-        for reserved in ec2.get_all_reserved_instances():
-            if reserved.state != "active":
-                continue
-            self.addri(reserved.instance_type, reserved.availability_zone,
-                       self._get_platform(reserved), reserved)
-
-        for reservation in ec2.get_all_instances():
-            for instance in reservation.instances:
-                if instance.state != 'running':
-                    continue
-                if instance.spot_instance_request_id:
-                    self.adds(instance.instance_type, instance.placement,
-                              self._get_platform(instance), instance)
-                else:
-                    self.addi(instance.instance_type, instance.placement,
-                              self._get_platform(instance), instance)
-
-
-    def addri(self, type_, zone, plat, ri):
-        self.instances[type_][plat]["ri"].append(ri)
-
-    def addi(self, type_, zone, plat, ii):
-        self.instances[type_][plat]['iis'].append(ii)
-
-    def adds(self, type_, zone, plat, spot):
-        self.instances[type_][plat]['spot'].append(spot)
-
     def _get_platform(self, ii_or_ri):
         if hasattr(ii_or_ri, 'description'):
             if 'VPC' in ii_or_ri.description:
@@ -99,6 +48,74 @@ class RegionalMap(object):
         if ii_or_ri.vpc_id:
             return 'EC2-VPC'
         return 'EC2-Classic'
+
+    def group_by_zone_and_plat(self):
+        zones = dd(lambda: dd(lambda : IL()))
+        for i in self.l:
+            if hasattr(i, 'placement'):
+                zones[self._get_platform(i)][i.placement].append(i)
+            elif hasattr(i, 'availability_zone'):
+                zones[self._get_platform(i)][i.availability_zone].append(i)
+            else:
+                raise TypeError("unknown object type %s" % (type(i),))
+        return zones
+
+    @property
+    def ids(self):
+        return [i.id for i in self.l]
+
+def conf_target_to_dict(tc):
+    return {"az": tc.availability_zone,
+            "platform": tc.platform,
+            "instance_count": tc.instance_count,
+            "instance_type": tc.instance_type}
+
+def should_execute(changes):
+    if not changes:
+        return False
+    for platform, zones in changes.iteritems():
+        for zone, provision in zones.iteritems():
+            # Typically if there are other fields, they are added in a following
+            # step of the calling function. The actual recommendation is the
+            # first number in the list, and of course if they are all negative
+            # (meaning we should remove RIs) it means there's no point in moving
+            # things, so this checks that there's at least 1 positive value.
+            if provision[0] > 0:
+                return True
+    return False
+
+class RegionalMap(object):
+    """
+    This object represents the structure of a region in terms of instances,
+    spots and reserved instances
+    """
+
+    def __init__(self, region):
+        self.instances = dd(lambda: dd(lambda : IL()))
+        self.ec2 = ec2m.connect_to_region(region)
+
+        for reserved in self.ec2.get_all_reserved_instances():
+            if reserved.state != "active":
+                continue
+            self.addri(reserved.instance_type, reserved.availability_zone, reserved)
+
+        for reservation in self.ec2.get_all_instances():
+            for instance in reservation.instances:
+                if instance.state != 'running':
+                    continue
+                if instance.spot_instance_request_id:
+                    self.adds(instance.instance_type, instance.placement, instance)
+                else:
+                    self.addi(instance.instance_type, instance.placement, instance)
+
+    def addri(self, type_, zone, ri):
+        self.instances[type_]["ri"].append(ri)
+
+    def addi(self, type_, zone, ii):
+        self.instances[type_]['iis'].append(ii)
+
+    def adds(self, type_, zone, spot):
+        self.instances[type_]['spot'].append(spot)
 
     def ideal_target(self, age, commit=False):
         """
@@ -122,34 +139,43 @@ class RegionalMap(object):
         """
         changes = dd(lambda :dd(lambda: dd(lambda : [])))
         ideal_target = {}
-        for type_, platforms in self.instances.iteritems():
+        regional_situation = {}
+        for type_, instmap in self.instances.iteritems():
             target_configurations = []
-            for platform, counts in platforms.iteritems():
-                total_ris = len(counts["ri"])
+            regional_type_situation = {}
 
-                target_configurations.append("%s:%s" % (platform, total_ris))
+            total_ris = len(instmap["ri"])
 
-                # deserving_instances are all instances that have priority in being
-                # covered by a reserved instance.
-                counts['iis'].sort(lambda i: i.launch_time)
-                deserving_instances = counts['iis'][:total_ris]
+            # deserving_instmap are all instmap that have priority in being
+            # covered by a reserved instance.
+            instmap['iis'].sort(lambda i: i.launch_time)
+            deserving_instmap = instmap['iis'][:total_ris]
 
-                # And here we begin to find coverage holes.
-                grouped_instances = deserving_instances.group_by_zone()
-                grouped_ris = counts["ri"].group_by_zone()
+            total_iis = len(instmap['iis'])
+            total_deserving = len(deserving_instmap)
+            regional_type_situation["Total RI"] = total_ris
+            regional_type_situation["Total On Demand Sustained"] = total_deserving
+            regional_type_situation["Total On Demand"] = total_iis
 
-                # This is very useful when there are more RIs than availabilable
-                # instances. You don't quite know where to place the excess RIs
-                # and the current algorithm chooses to place all of them in the
-                # first zone that we iterate on.
-                pad = 0
-                if total_ris > len(counts['iis']):
-                    pad = total_ris - len(counts['iis'])
+            regional_situation[type_] = regional_type_situation
 
-                for zone in sorted(set(grouped_instances.keys() +
-                                grouped_ris.keys())):
-                    instances = grouped_instances[zone]
-                    ris = grouped_ris[zone]
+            # And here we begin to find coverage holes.
+            grouped_instmap = deserving_instmap.group_by_zone_and_plat()
+            grouped_ris = instmap["ri"].group_by_zone_and_plat()
+
+            # This is very useful when there are more RIs than availabilable
+            # instmap. You don't quite know where to place the excess RIs
+            # and the current algorithm chooses to place all of them in the
+            # first zone that we iterate on.
+            pad = 0
+            if total_ris > len(instmap['iis']):
+                pad = total_ris - len(instmap['iis'])
+
+            for platform in sorted(set(grouped_instmap.keys() + grouped_ris.keys())):
+                for zone in sorted(set(grouped_instmap[platform].keys() +
+                                       grouped_ris[platform].keys())):
+                    instances = grouped_instmap[platform][zone]
+                    ris = grouped_ris[platform][zone]
 
                     num_instances = len(instances)
                     num_ris = len(ris)
@@ -157,34 +183,47 @@ class RegionalMap(object):
                     if num_ris != num_instances:
                         changes[type_][platform][zone].append(num_instances-num_ris)
 
-                    target_configurations.append({
-                       'AvailabilityZone': zone,
-                       'Platform': platform,
-                       'InstanceCount': num_instances+pad,
-                       'InstanceType': type_
-                    })
+                    target_configurations.append(rim.ReservedInstancesConfiguration(
+                       availability_zone=zone,
+                       platform=platform,
+                       instance_count=num_instances+pad,
+                       instance_type=type_
+                    ))
                     pad = 0
 
-                    rest = counts['iis'][total_ris:]
-                    if not rest:
-                        continue
-
-                    age_string = age.isoformat().rsplit('.', 1)[0] + ".000Z"
-                    new_suggested = [i for i in rest if i.launch_time <= age_string]
-
-                    if not new_suggested:
-                        continue
-
-                    changes[type_][platform][zone].append("+R:%s" % len(new_suggested))
-
+            # Save the target configuration
             ideal_target[type_] = target_configurations
 
+            # If asked to commit it, do it
             if commit:
-                ri_ids = counts["ri"].ids
-                target_configurations
+                if should_execute(changes[type_]):
+                    print self.ec2.modify_reserved_instances(
+                        client_token='123',
+                        reserved_instance_ids=instmap["ri"].ids,
+                        target_configurations=target_configurations
+                    )
+                else:
+                    print "Skipping...", region, type_
 
 
-        return changes, ideal_target
+            # Try to guess what would be a good new purchase of RIs
+            rest = instmap['iis'][total_ris:]
+            if not rest:
+                continue
+
+            age_string = age.isoformat().rsplit('.', 1)[0] + ".000Z"
+            new_suggested = IL([i for i in rest if i.launch_time <= age_string])
+
+            if not new_suggested:
+                continue
+
+            suggested = new_suggested.group_by_zone_and_plat()
+            for platform, zones in suggested.iteritems():
+                for zone, insts in zones.iteritems():
+                    changes[type_][platform][zone].append("+R:%s" % len(new_suggested))
+
+
+        return changes, ideal_target, regional_situation
 
 if __name__ == "__main__":
     res_age = datetime.utcnow() - timedelta(weeks=1)
@@ -194,7 +233,8 @@ if __name__ == "__main__":
 
         print "=============  " + region + "  =============="
         rrimap = RegionalMap(region)
-        changes, targets = rrimap.ideal_target(res_age)
+        changes, targets, regional_situation = rrimap.ideal_target(res_age, True)
         pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(changes).items()})
-        pp(targets)
+        # pp({k: [conf_target_to_dict(i) for i in v] for k, v in targets.items()})
+        # pp(regional_situation)
 
