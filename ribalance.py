@@ -21,7 +21,7 @@ class IL(object):
             self.l = []
 
     def tags(self, tagname):
-        return set(item.tags.get(tagname) for item in self.l)
+        return sorted(list(set(item.tags.get(tagname) for item in self.l)))
 
     def append(self, item):
         self.l.append(item)
@@ -31,6 +31,15 @@ class IL(object):
 
     def __getitem__(self, val):
         if isinstance(val, slice):
+            if isinstance(val.start, basestring) and isinstance(val.stop, basestring):
+                # this is actually filtering for age using an age string
+                return IL([i for i in self.l if val.start <= i.launch_time <= val.stop])
+            elif isinstance(val.start, basestring):
+                # pass
+                return IL([i for i in self.l if val.start <= i.launch_time])
+            elif isinstance(val.stop, basestring):
+                # pass
+                return IL([i for i in self.l if i.launch_time <= val.stop])
             return IL(self.l[val.start:val.stop:val.step])
         return self.l[val]
 
@@ -119,7 +128,7 @@ class RegionalMap(object):
     def adds(self, type_, zone, spot):
         self.instances[type_]['spot'].append(spot)
 
-    def ideal_target(self, age, commit=False):
+    def ideal_target(self, age, tag, commit=False):
         """
         This is a relatively simple algorithm.
 
@@ -139,13 +148,13 @@ class RegionalMap(object):
         if the total result of a region is a negative net change it means that
         there's too many reserved instances.
         """
+        age_string = age.isoformat().rsplit('.', 1)[0] + ".000Z"
         changes = dd(lambda :dd(lambda: dd(lambda : [])))
         ideal_target = {}
-        regional_situation = {}
+        regional_situation = dd(lambda :dd(lambda: dd(lambda : {})))
         mods = []
         for type_, instmap in self.instances.iteritems():
             target_configurations = []
-            regional_type_situation = {}
 
             total_ris = len(instmap["ri"])
 
@@ -156,15 +165,15 @@ class RegionalMap(object):
 
             total_iis = len(instmap['iis'])
             total_deserving = len(deserving_instmap)
-            regional_type_situation["Total RI"] = total_ris
-            regional_type_situation["Total On Demand Sustained"] = total_deserving
-            regional_type_situation["Total On Demand"] = total_iis
-
-            regional_situation[type_] = regional_type_situation
+            # regional_situation[type_]["Total RI"] = total_ris
+            # regional_situation[type_]["Total On Demand Sustained"] = total_deserving
+            # regional_situation[type_]["Total On Demand"] = total_iis
+            # regional_situation[type_]
 
             # And here we begin to find coverage holes.
             grouped_instmap = deserving_instmap.group_by_zone_and_plat()
             grouped_ris = instmap["ri"].group_by_zone_and_plat()
+            grouped_iis = instmap['iis'].group_by_zone_and_plat()
 
             # This is very useful when there are more RIs than availabilable
             # instmap. You don't quite know where to place the excess RIs
@@ -182,6 +191,11 @@ class RegionalMap(object):
 
                     num_instances = len(instances)
                     num_ris = len(ris)
+
+                    regional_situation[type_][zone][platform]["RI"] = num_ris
+                    regional_situation[type_][zone][platform]["OnDemand"] = len(grouped_iis[platform][zone])
+                    regional_situation[type_][zone][platform]["OnDemand Sustained"] = len(grouped_iis[platform][zone][:age_string])
+                    regional_situation[type_][zone][platform]["Tags"] = grouped_iis[platform][zone].tags(tag)
 
                     if num_ris != num_instances:
                         changes[type_][platform][zone].append(num_instances-num_ris)
@@ -215,8 +229,7 @@ class RegionalMap(object):
             if not rest:
                 continue
 
-            age_string = age.isoformat().rsplit('.', 1)[0] + ".000Z"
-            new_suggested = IL([i for i in rest if i.launch_time <= age_string])
+            new_suggested = rest[:age_string]
 
             if not new_suggested:
                 continue
@@ -224,7 +237,8 @@ class RegionalMap(object):
             suggested = new_suggested.group_by_zone_and_plat()
             for platform, zones in suggested.iteritems():
                 for zone, insts in zones.iteritems():
-                    changes[type_][platform][zone].append("+R:%s" % len(new_suggested))
+                    changes[type_][platform][zone].append("+R:%s" % len(insts))
+                    changes[type_][platform][zone].append(insts.tags(tag))
 
 
         return changes, ideal_target, regional_situation, mods
@@ -243,9 +257,8 @@ if __name__ == "__main__":
     parser.add_argument('--changes', action='store_true', help='Display changes')
     parser.add_argument('--target', action='store_true', help='Display target')
     parser.add_argument('--state', action='store_true', help='Display state')
+    parser.add_argument('--tag', type=str, default="application", help='Name of the tag that splits the different applications')
     parser.add_argument('--age', type=int, default=168, help='Hours since launch to consider sustained (1wk default)')
-
-
 
     args = parser.parse_args()
 
@@ -253,7 +266,7 @@ if __name__ == "__main__":
     for region in args.regions:
         print "=============  " + region + "  =============="
         rrimap = RegionalMap(region)
-        changes, targets, regional_situation, mods = rrimap.ideal_target(res_age, args.commit)
+        changes, targets, regional_situation, mods = rrimap.ideal_target(res_age, args.tag, args.commit)
         if args.changes:
             print "changes"
             pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(changes).items()})
@@ -262,7 +275,7 @@ if __name__ == "__main__":
             pp({k: [conf_target_to_dict(i) for i in v] for k, v in targets.items()})
         if args.state:
             print "regional breakdown"
-            pp(regional_situation)
+            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(regional_situation).items()})
         if args.commit:
             print "RI Modifications"
             pp(mods)
