@@ -264,14 +264,6 @@ class RegionalMap(object):
                                      )
                                     )
                         )
-                        # mods.append((type_, dict(
-                        #     client_token=client_token,
-                        #     reserved_instance_ids=grouped_ris.ids,
-                        #     num_reserved_instance=len(grouped_ris),
-                        #     target_configurations=[conf_target_to_dict(tc)
-                        #                            for tc in
-                        #                            grouped_targets]
-                        # )))
                 except Exception, e:
                     print "Error", region, type_, e
                     if "Invalid value for 'clientToken'" in e.message:
@@ -322,7 +314,6 @@ class RegionalMap(object):
         self.recs = recs = dd(lambda :dd(lambda: dd(lambda : [])))
         self.ideal_target = ideal_target = {}
         self.state = regional_situation = dd(lambda :dd(lambda: dd(lambda : {})))
-        # mods = []
         for type_, instmap in self.instances.iteritems():
             target_configurations = []
 
@@ -383,40 +374,6 @@ class RegionalMap(object):
             # Save the target configuration
             ideal_target[type_] = target_configurations
 
-            # If asked to commit it, do it
-            # if commit:
-            #     if should_execute(changes[type_]) and instmap["ri"].ids:
-            #         try:
-            #             grouped_ris_and_targets = match_targets(instmap["ri"].group_by_end_hour(), target_configurations)
-            #             for hour, grouped_ris, grouped_targets in grouped_ris_and_targets:
-            #                 client_token = ".".join([
-            #                     datetime.utcnow().replace(minute=0, second=0, microsecond=0).isoformat(),
-            #                     type_,
-            #                     hour
-            #                 ])
-
-            #                 mods.append((type_, self.ec2.modify_reserved_instances(
-            #                     client_token=client_token,
-            #                     reserved_instance_ids=grouped_ris.ids,
-            #                     target_configurations=grouped_targets
-            #                 )))
-            #                 # mods.append((type_, dict(
-            #                 #     client_token=client_token,
-            #                 #     reserved_instance_ids=grouped_ris.ids,
-            #                 #     num_reserved_instance=len(grouped_ris),
-            #                 #     target_configurations=[conf_target_to_dict(tc)
-            #                 #                            for tc in
-            #                 #                            grouped_targets]
-            #                 # )))
-            #         except Exception, e:
-            #             print "Error", region, type_, e
-            #             if "Invalid value for 'clientToken'" in e.message:
-            #                 continue
-            #             raise
-            #     else:
-            #         print "Skipping...", region, type_
-
-
             # Try to guess what would be a good new purchase of RIs
             rest = instmap['iis'][total_ris:]
             if not rest:
@@ -432,9 +389,6 @@ class RegionalMap(object):
                 for zone, insts in zones.iteritems():
                     recs[type_][platform][zone].append("+R:%s" % len(insts))
                     recs[type_][platform][zone].append(insts.tags(tag))
-
-
-#         return changes, ideal_target, regional_situation, recs, mods
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ribalance will try to allocate your RIs in the most efficient way.',
@@ -464,7 +418,6 @@ if __name__ == "__main__":
     for region in args.regions:
         print "=============  " + region + "  =============="
         rrimap = RegionalMap(region)
-        # changes, targets, regional_situation, recs, mods = rrimap.ideal_target(res_age, args.tag, args.commit)
         rrimap.ideal_target(res_age, args.tag)
         if args.changes:
             print "changes"
