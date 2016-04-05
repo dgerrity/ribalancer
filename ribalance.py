@@ -1,10 +1,10 @@
+import boto3
 import argparse
 
 from pprint import pprint as pp
+from dateutil.tz.tz import tzutc
 from datetime import datetime, timedelta
 from collections import defaultdict as dd
-from boto import ec2 as ec2m
-from boto.ec2 import reservedinstance as rim
 
 class IL(object):
     """
@@ -21,7 +21,14 @@ class IL(object):
             self.l = []
 
     def tags(self, tagname):
-        return sorted(list(set(item.tags.get(tagname) for item in self.l)))
+        out = []
+        for item in self.l:
+            for tag in item.get('Tags', []):
+                if tag.get('Key') == tagname:
+                    out.append(tag.get('Value'))
+                else:
+                    out.append(None)
+        return sorted(set(out))
 
     def append(self, item):
         self.l.append(item)
@@ -31,21 +38,18 @@ class IL(object):
 
     def __getitem__(self, val):
         if isinstance(val, slice):
-            if isinstance(val.start, basestring) and isinstance(val.stop, basestring):
-                # this is actually filtering for age using an age string
-                return IL([i for i in self.l if val.start <= i.launch_time <= val.stop])
-            elif isinstance(val.start, basestring):
-                # pass
-                return IL([i for i in self.l if val.start <= i.launch_time])
-            elif isinstance(val.stop, basestring):
-                # pass
-                return IL([i for i in self.l if i.launch_time <= val.stop])
+            if isinstance(val.start, datetime) and isinstance(val.stop, datetime):
+                return IL([i for i in self.l if val.start <= i.get('LaunchTime') <= val.stop])
+            elif isinstance(val.start, datetime):
+                return IL([i for i in self.l if val.start <= i.get('LaunchTime')])
+            elif isinstance(val.stop, datetime):
+                return IL([i for i in self.l if i.get('LaunchTime') <= val.stop])
             return IL(self.l[val.start:val.stop:val.step])
         return self.l[val]
 
     def __len__(self):
-        if self.l and hasattr(self.l[0], 'instance_count'):
-            return sum(item.instance_count for item in self.l)
+        if self.l and 'InstanceCount' in self.l[0]:
+            return sum(item.get('InstanceCount') for item in self.l)
         return len(self.l)
 
     def sort(self, key=None):
@@ -57,41 +61,33 @@ class IL(object):
         # minutes. Why even have this to begin with?
         o = dd(lambda : IL())
         for ri in self.l:
-            o[self._get_ri_end_time(ri)].append(ri)
+            o[ri.get('End')].append(ri)
         return o
 
-    def _get_ri_end_time(self, ri):
-        return datetime.strptime(ri.end.split(':', 1)[0], "%Y-%m-%dT%H").isoformat()
-
     def _get_platform(self, ii_or_ri):
-        if hasattr(ii_or_ri, 'description'):
-            if 'VPC' in ii_or_ri.description:
+        description = ii_or_ri.get('ProductDescription')
+        if description is not None:
+            if 'VPC' in description:
                 return 'EC2-VPC'
             return 'EC2-Classic'
-        if ii_or_ri.vpc_id:
+        if ii_or_ri.get('VpcId'):
             return 'EC2-VPC'
         return 'EC2-Classic'
 
     def group_by_zone_and_plat(self):
         zones = dd(lambda: dd(lambda : IL()))
         for i in self.l:
-            if hasattr(i, 'placement'):
-                zones[self._get_platform(i)][i.placement].append(i)
-            elif hasattr(i, 'availability_zone'):
-                zones[self._get_platform(i)][i.availability_zone].append(i)
+            if 'Placement' in i:
+                zones[self._get_platform(i)][i.get('Placement').get('AvailabilityZone')].append(i)
+            elif 'AvailabilityZone' in i:
+                zones[self._get_platform(i)][i.get('AvailabilityZone')].append(i)
             else:
-                raise TypeError("unknown object type %s" % (type(i),))
+                raise TypeError("unknown object type %s" % (i,))
         return zones
 
     @property
     def ids(self):
-        return [i.id for i in self.l]
-
-def conf_target_to_dict(tc):
-    return {"az": tc.availability_zone,
-            "platform": tc.platform,
-            "instance_count": tc.instance_count,
-            "instance_type": tc.instance_type}
+        return [i.get('ReservedInstancesId') or i.get('InstanceId') for i in self.l]
 
 def should_execute(changes):
     if not changes:
@@ -116,12 +112,13 @@ class TargetConfigSlicer(object):
             idx = idxs[cidx]
             t = self.l[i]
 
-            if s+t.instance_count < idx:
-                s += t.instance_count
+            instance_count = t.get('InstanceCount')
+            if s+instance_count < idx:
+                s += instance_count
 
-            elif s+t.instance_count == idx:
+            elif s+instance_count == idx:
                 cidx += 1 # This split was fine, next one.
-                s += t.instance_count
+                s += instance_count
 
             else: # s + t.instance_count > idx
                 # if we exceed the idx in this loop, let's split the target
@@ -130,16 +127,13 @@ class TargetConfigSlicer(object):
                 # need to split again before the end of this TargetConfig.
                 # I'm also not adding the whole thing to s either, just as much
                 # as I used in the first step which is pre_size.
-                post_size = s + t.instance_count - idx
-                pre_size = t.instance_count - post_size
+                post_size = s + instance_count - idx
+                pre_size = instance_count - post_size
 
-                t.instance_count = pre_size
-                self.l.insert(i+1, rim.ReservedInstancesConfiguration(
-                        availability_zone=t.availability_zone,
-                        platform=t.platform,
-                        instance_count=post_size,
-                        instance_type=t.instance_type
-                ))
+                t['InstanceCount'] = pre_size
+                new_t = dict(t)
+                new_t['InstanceCount'] = post_size
+                self.l.insert(i+1, new_t)
                 cidx += 1
                 s += pre_size
 
@@ -154,23 +148,24 @@ class TargetConfigSlicer(object):
             stop = val.stop or len(self)
             found_start = False
             for t in self.l:
+                instance_count = t.get('InstanceCount')
                 # No changes to self.l, ideally we've already called
                 # make_splits_at
-                if not found_start and start+t.instance_count <= val.start:
-                    start += t.instance_count
+                if not found_start and start+instance_count <= val.start:
+                    start += instance_count
                     if start == val.start:
                         found_start = True
                     continue
 
-                if start+t.instance_count < stop:
+                if start+instance_count < stop:
                     out.append(t)
-                    start += t.instance_count
+                    start += instance_count
 
-                elif start+t.instance_count == stop:
+                elif start+instance_count == stop:
                     out.append(t)
                     return out
 
-                elif start+t.instance_count > stop:
+                elif start+instance_count > stop:
                     raise Exception("Have you called make_splits_at?")
 
         return self.l[val]
@@ -194,7 +189,7 @@ def match_targets(ris, targets):
     Basically we need a list object that supports slicing through this list and
     knows how to generate new objects of a certain kind.
     """
-    targets.sort(key=lambda o: o.availability_zone)
+    targets.sort(key=lambda o: o.get('AvailabilityZone'))
     targets = TargetConfigSlicer(targets)
 
     splits = []
@@ -222,21 +217,21 @@ class RegionalMap(object):
 
     def __init__(self, region):
         self.instances = dd(lambda: dd(lambda : IL()))
-        self.ec2 = ec2m.connect_to_region(region)
+        self.ec2 = boto3.client('ec2', region)
 
-        for reserved in self.ec2.get_all_reserved_instances():
-            if reserved.state != "active":
+        for reserved in self.ec2.describe_reserved_instances().get('ReservedInstances', []):
+            if reserved['State'] != "active":
                 continue
-            self.addri(reserved.instance_type, reserved.availability_zone, reserved)
+            self.addri(reserved['InstanceType'], reserved['AvailabilityZone'], reserved)
 
-        for reservation in self.ec2.get_all_instances():
-            for instance in reservation.instances:
-                if instance.state != 'running':
+        for reservation in self.ec2.describe_instances().get('Reservations', []):
+            for instance in reservation['Instances']:
+                if instance['State']['Name'] != 'running':
                     continue
-                if instance.spot_instance_request_id:
-                    self.adds(instance.instance_type, instance.placement, instance)
+                if instance.get('InstanceLifecycle') == "spot":
+                    self.adds(instance['InstanceType'], instance['Placement']['AvailabilityZone'], instance)
                 else:
-                    self.addi(instance.instance_type, instance.placement, instance)
+                    self.addi(instance['InstanceType'], instance['Placement']['AvailabilityZone'], instance)
 
     def addri(self, type_, zone, ri):
         self.instances[type_]["ri"].append(ri)
@@ -267,7 +262,6 @@ class RegionalMap(object):
         if the total result of a region is a negative net change it means that
         there's too many reserved instances.
         """
-        age_string = age.isoformat().rsplit('.', 1)[0] + ".000Z"
         changes = dd(lambda :dd(lambda: dd(lambda : [])))
         recs = dd(lambda :dd(lambda: dd(lambda : [])))
         ideal_target = {}
@@ -280,7 +274,7 @@ class RegionalMap(object):
 
             # deserving_instmap are all instmap that have priority in being
             # covered by a reserved instance.
-            instmap['iis'].sort(lambda i: i.launch_time)
+            instmap['iis'].sort(lambda i: i.get('LaunchTime'))
             deserving_instmap = instmap['iis'][:total_ris]
 
             total_iis = len(instmap['iis'])
@@ -310,7 +304,7 @@ class RegionalMap(object):
 
                     regional_situation[type_][zone][platform]["RI"] = num_ris
                     regional_situation[type_][zone][platform]["OnDemand"] = len(grouped_iis[platform][zone])
-                    regional_situation[type_][zone][platform]["OnDemand Sustained"] = len(grouped_iis[platform][zone][:age_string])
+                    regional_situation[type_][zone][platform]["OnDemand Sustained"] = len(grouped_iis[platform][zone][:age])
                     regional_situation[type_][zone][platform]["Tags"] = grouped_iis[platform][zone].tags(tag)
 
 
@@ -321,11 +315,12 @@ class RegionalMap(object):
                         # Instance count can't be negative or 0.
                         print "Skipping zero or negative instance count...", region, type_
                         continue
-                    target_configurations.append(rim.ReservedInstancesConfiguration(
-                       availability_zone=zone,
-                       platform=platform,
-                       instance_count=num_instances+pad,
-                       instance_type=type_
+
+                    target_configurations.append(dict(
+                       AvailabilityZone=zone,
+                       Platform=platform,
+                       InstanceCount=num_instances+pad,
+                       InstanceType=type_
                     ))
                     pad = 0
 
@@ -371,7 +366,7 @@ class RegionalMap(object):
             if not rest:
                 continue
 
-            new_suggested = rest[:age_string]
+            new_suggested = rest[:age]
 
             if not new_suggested:
                 continue
@@ -389,12 +384,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ribalance will try to allocate your RIs in the most efficient way.',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    dr = ec2m.RegionData.keys()
+    regions = ['us-east-1', 'cn-north-1', 'ap-northeast-1', 'ap-southeast-2',
+               'sa-east-1', 'ap-southeast-1', 'ap-northeast-2', 'us-west-2',
+               'us-gov-west-1', 'us-west-1', 'eu-central-1', 'eu-west-1']
+    dr = list(regions)
     dr.remove('cn-north-1')
     dr.remove('us-gov-west-1')
 
-    parser.add_argument('--regions', nargs='*', default=dr,
-                        choices=ec2m.RegionData.keys(), help='Regions to apply this')
+
+    parser.add_argument('--regions', nargs='*', default=dr, choices=regions, help='Regions to apply this')
     parser.add_argument('--commit', action='store_true', help='Should apply changes') 
     parser.add_argument('--changes', action='store_true', help='Display changes')
     parser.add_argument('--recs', action='store_true', help='Display recommendations on new RI purchases')
@@ -406,6 +404,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     res_age = datetime.utcnow() - timedelta(hours=args.age)
+    res_age = res_age.replace(tzinfo=tzutc())
     for region in args.regions:
         print "=============  " + region + "  =============="
         rrimap = RegionalMap(region)
@@ -418,7 +417,7 @@ if __name__ == "__main__":
             pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(recs).items()})
         if args.target:
             print "targets"
-            pp({k: [conf_target_to_dict(i) for i in v] for k, v in targets.items()})
+            pp(targets)
         if args.state:
             print "regional breakdown"
             pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(regional_situation).items()})
