@@ -243,7 +243,62 @@ class RegionalMap(object):
     def adds(self, type_, zone, spot):
         self.instances[type_]['spot'].append(spot)
 
-    def ideal_target(self, age, tag, commit=False):
+    def commit(self):
+        mods = []
+        for type_, instmap in self.instances.iteritems():
+            if should_execute(self.changes[type_]) and instmap["ri"].ids:
+                try:
+                    grouped_ris_and_targets = match_targets(instmap["ri"].group_by_end_hour(), self.ideal_target[type_])
+                    for hour, grouped_ris, grouped_targets in grouped_ris_and_targets:
+                        client_token = ".".join([
+                            datetime.utcnow().replace(minute=0, second=0, microsecond=0).isoformat(),
+                            type_,
+                            hour.isoformat()
+                        ])
+
+                        mods.append((type_,
+                                     self.ec2.modify_reserved_instances(
+                                        ClientToken=client_token,
+                                        ReservedInstancesIds=grouped_ris.ids,
+                                        TargetConfigurations=grouped_targets
+                                     )
+                                    )
+                        )
+                        # mods.append((type_, dict(
+                        #     client_token=client_token,
+                        #     reserved_instance_ids=grouped_ris.ids,
+                        #     num_reserved_instance=len(grouped_ris),
+                        #     target_configurations=[conf_target_to_dict(tc)
+                        #                            for tc in
+                        #                            grouped_targets]
+                        # )))
+                except Exception, e:
+                    print "Error", region, type_, e
+                    if "Invalid value for 'clientToken'" in e.message:
+                        continue
+                    raise
+            else:
+                print "Skipping...", region, type_
+        return mods
+
+    @property
+    def proposed_changes(self):
+        return self.changes
+
+    @property
+    def current_state(self):
+        return self.state
+
+    @property
+    def new_ri_recommendations(self):
+        return self.recs
+
+    @property
+    def target_configurations(self):
+        return self.ideal_target
+
+
+    def ideal_target(self, age, tag):
         """
         This is a relatively simple algorithm.
 
@@ -263,11 +318,11 @@ class RegionalMap(object):
         if the total result of a region is a negative net change it means that
         there's too many reserved instances.
         """
-        changes = dd(lambda :dd(lambda: dd(lambda : [])))
-        recs = dd(lambda :dd(lambda: dd(lambda : [])))
-        ideal_target = {}
-        regional_situation = dd(lambda :dd(lambda: dd(lambda : {})))
-        mods = []
+        self.changes = changes = dd(lambda :dd(lambda: dd(lambda : [])))
+        self.recs = recs = dd(lambda :dd(lambda: dd(lambda : [])))
+        self.ideal_target = ideal_target = {}
+        self.state = regional_situation = dd(lambda :dd(lambda: dd(lambda : {})))
+        # mods = []
         for type_, instmap in self.instances.iteritems():
             target_configurations = []
 
@@ -329,37 +384,37 @@ class RegionalMap(object):
             ideal_target[type_] = target_configurations
 
             # If asked to commit it, do it
-            if commit:
-                if should_execute(changes[type_]) and instmap["ri"].ids:
-                    try:
-                        grouped_ris_and_targets = match_targets(instmap["ri"].group_by_end_hour(), target_configurations)
-                        for hour, grouped_ris, grouped_targets in grouped_ris_and_targets:
-                            client_token = ".".join([
-                                datetime.utcnow().replace(minute=0, second=0, microsecond=0).isoformat(),
-                                type_,
-                                hour
-                            ])
+            # if commit:
+            #     if should_execute(changes[type_]) and instmap["ri"].ids:
+            #         try:
+            #             grouped_ris_and_targets = match_targets(instmap["ri"].group_by_end_hour(), target_configurations)
+            #             for hour, grouped_ris, grouped_targets in grouped_ris_and_targets:
+            #                 client_token = ".".join([
+            #                     datetime.utcnow().replace(minute=0, second=0, microsecond=0).isoformat(),
+            #                     type_,
+            #                     hour
+            #                 ])
 
-                            mods.append((type_, self.ec2.modify_reserved_instances(
-                                client_token=client_token,
-                                reserved_instance_ids=grouped_ris.ids,
-                                target_configurations=grouped_targets
-                            )))
-                            # mods.append((type_, dict(
-                            #     client_token=client_token,
-                            #     reserved_instance_ids=grouped_ris.ids,
-                            #     num_reserved_instance=len(grouped_ris),
-                            #     target_configurations=[conf_target_to_dict(tc)
-                            #                            for tc in
-                            #                            grouped_targets]
-                            # )))
-                    except Exception, e:
-                        print "Error", region, type_, e
-                        if "Invalid value for 'clientToken'" in e.message:
-                            continue
-                        raise
-                else:
-                    print "Skipping...", region, type_
+            #                 mods.append((type_, self.ec2.modify_reserved_instances(
+            #                     client_token=client_token,
+            #                     reserved_instance_ids=grouped_ris.ids,
+            #                     target_configurations=grouped_targets
+            #                 )))
+            #                 # mods.append((type_, dict(
+            #                 #     client_token=client_token,
+            #                 #     reserved_instance_ids=grouped_ris.ids,
+            #                 #     num_reserved_instance=len(grouped_ris),
+            #                 #     target_configurations=[conf_target_to_dict(tc)
+            #                 #                            for tc in
+            #                 #                            grouped_targets]
+            #                 # )))
+            #         except Exception, e:
+            #             print "Error", region, type_, e
+            #             if "Invalid value for 'clientToken'" in e.message:
+            #                 continue
+            #             raise
+            #     else:
+            #         print "Skipping...", region, type_
 
 
             # Try to guess what would be a good new purchase of RIs
@@ -379,7 +434,7 @@ class RegionalMap(object):
                     recs[type_][platform][zone].append(insts.tags(tag))
 
 
-        return changes, ideal_target, regional_situation, recs, mods
+#         return changes, ideal_target, regional_situation, recs, mods
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ribalance will try to allocate your RIs in the most efficient way.',
@@ -409,20 +464,21 @@ if __name__ == "__main__":
     for region in args.regions:
         print "=============  " + region + "  =============="
         rrimap = RegionalMap(region)
-        changes, targets, regional_situation, recs, mods = rrimap.ideal_target(res_age, args.tag, args.commit)
+        # changes, targets, regional_situation, recs, mods = rrimap.ideal_target(res_age, args.tag, args.commit)
+        rrimap.ideal_target(res_age, args.tag)
         if args.changes:
             print "changes"
-            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(changes).items()})
+            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(rrimap.proposed_changes).items()})
         if args.recs:
             print "recs"
-            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(recs).items()})
+            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(rrimap.new_ri_recommendations).items()})
         if args.target:
             print "targets"
-            pp(targets)
+            pp(rrimap.target_configurations)
         if args.state:
             print "regional breakdown"
-            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(regional_situation).items()})
+            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(rrimap.state).items()})
         if args.commit:
             print "RI Modifications"
-            pp(mods)
+            pp(rrimap.commit())
 
