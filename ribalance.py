@@ -51,6 +51,19 @@ class IL(object):
     def sort(self, key=None):
         self.l.sort(key=key)
 
+    def group_by_end_hour(self):
+        # This is seriously the most bizarre requirement... In order to modify
+        # RIs together they need to end in the same hour, not seconds or
+        # minutes. Why even have this to begin with?
+        o = dd(lambda : IL())
+        for ri in self.l:
+            o[self._get_ri_end_time(ri).isoformat()].append(ri)
+        return o
+
+    def _get_ri_end_time(self, ri):
+        d = datetime.strptime(ri.start.split(':', 1)[0], "%Y-%m-%dT%H")
+        return d + timedelta(seconds=ri.duration)
+
     def _get_platform(self, ii_or_ri):
         if hasattr(ii_or_ri, 'description'):
             if 'VPC' in ii_or_ri.description:
@@ -94,6 +107,118 @@ def should_execute(changes):
             if provision[0] > 0:
                 return True
     return False
+
+class TargetConfigSlicer(object):
+    def __init__(self, l=None):
+        self.l = l
+        if l is None:
+            self.l = []
+
+    def make_splits_at(self, idxs):
+        s = 0
+        i = 0
+        cidx = 0
+        while i < len(self.l) and cidx < len(idxs):
+            idx = idxs[cidx]
+            t = self.l[i]
+
+            if s+t.instance_count < idx:
+                s += t.instance_count
+
+            elif s+t.instance_count == idx:
+                cidx += 1 # This split was fine, next one.
+                s += t.instance_count
+
+            else: # s + t.instance_count > idx
+                # if we exceed the idx in this loop, let's split the target
+                # config at this point in 2, and proceed to the next split
+                # I'm inserting after the current split because if I might
+                # need to split again before the end of this TargetConfig.
+                # I'm also not adding the whole thing to s either, just as much
+                # as I used in the first step which is pre_size.
+                post_size = s + t.instance_count - idx
+                pre_size = t.instance_count - post_size
+
+                t.instance_count = pre_size
+                self.l.insert(i+1, rim.ReservedInstancesConfiguration(
+                        availability_zone=t.availability_zone,
+                        platform=t.platform,
+                        instance_count=post_size,
+                        instance_type=t.instance_type
+                ))
+                cidx += 1
+                s += pre_size
+
+            i += 1
+
+    def __getitem__(self, val):
+        if isinstance(val, slice):
+            out = []
+            i = 0
+            aggr = 0
+            start = 0
+            stop = val.stop or len(self)
+            found_start = False
+            for t in self.l:
+                # No changes to self.l, ideally we've already called
+                # make_splits_at
+                if not found_start and start+t.instance_count <= val.start:
+                    start += t.instance_count
+                    if start == val.start:
+                        found_start = True
+                    continue
+
+                if start+t.instance_count < stop:
+                    out.append(t)
+                    start += t.instance_count
+
+                elif start+t.instance_count == stop:
+                    out.append(t)
+                    return out
+
+                elif start+t.instance_count > stop:
+                    raise Exception("Have you called make_splits_at?")
+
+        return self.l[val]
+
+
+    def __len__(self):
+        return sum(i.instance_count for i in self.l)
+
+
+def match_targets(ris, targets):
+    """
+    ri is a map
+        {end_time: [ri, ri, ri],
+         end_time2: [ri, ri, ri]}
+    targets is a list:
+        [tc1, tc2, tc3]
+
+    each individual item here underlies more than 1 item. The point here is to
+    align each group of reservations with the group of tcs.
+
+    Basically we need a list object that supports slicing through this list and
+    knows how to generate new objects of a certain kind.
+    """
+    targets.sort(key=lambda o: o.availability_zone)
+    targets = TargetConfigSlicer(targets)
+
+    splits = []
+    aggr = 0
+    for _, v in ris.items():
+        splits.append(len(v)+aggr)
+        aggr += len(v)
+    targets.make_splits_at(splits)
+
+    out = []
+    s = 0
+    for hour, ri_group in ris.iteritems():
+        target_group = targets[s:s+len(ri_group)]
+        s += len(ri_group)
+
+        out.append((hour, ri_group, target_group))
+
+    return out
 
 class RegionalMap(object):
     """
@@ -165,10 +290,6 @@ class RegionalMap(object):
 
             total_iis = len(instmap['iis'])
             total_deserving = len(deserving_instmap)
-            # regional_situation[type_]["Total RI"] = total_ris
-            # regional_situation[type_]["Total On Demand Sustained"] = total_deserving
-            # regional_situation[type_]["Total On Demand"] = total_iis
-            # regional_situation[type_]
 
             # And here we begin to find coverage holes.
             grouped_instmap = deserving_instmap.group_by_zone_and_plat()
@@ -197,9 +318,14 @@ class RegionalMap(object):
                     regional_situation[type_][zone][platform]["OnDemand Sustained"] = len(grouped_iis[platform][zone][:age_string])
                     regional_situation[type_][zone][platform]["Tags"] = grouped_iis[platform][zone].tags(tag)
 
+
                     if num_ris != num_instances:
                         changes[type_][platform][zone].append(num_instances-num_ris)
 
+                    if num_instances+pad <= 0:
+                        # Instance count can't be negative or 0.
+                        print "Skipping zero or negative instance count...", region, type_
+                        continue
                     target_configurations.append(rim.ReservedInstancesConfiguration(
                        availability_zone=zone,
                        platform=platform,
@@ -214,12 +340,31 @@ class RegionalMap(object):
             # If asked to commit it, do it
             if commit:
                 if should_execute(changes[type_]) and instmap["ri"].ids:
-                    client_token = datetime.utcnow().replace(second=0, microsecond=0).isoformat()
-                    mods.append((type_, self.ec2.modify_reserved_instances(
-                        client_token=client_token,
-                        reserved_instance_ids=instmap["ri"].ids,
-                        target_configurations=target_configurations
-                    )))
+                    try:
+                        grouped_ris_and_targets = match_targets(instmap["ri"].group_by_end_hour(), target_configurations)
+                        for hour, grouped_ris, grouped_targets in grouped_ris_and_targets:
+                            client_token = ".".join([
+                                datetime.utcnow().replace(second=0, microsecond=0).isoformat(),
+                                type_,
+                                hour
+                            ])
+
+                            mods.append((type_, self.ec2.modify_reserved_instances(
+                                client_token=client_token,
+                                reserved_instance_ids=grouped_ris.ids,
+                                target_configurations=grouped_targets
+                            )))
+                            # mods.append((type_, dict(
+                            #     client_token=client_token,
+                            #     reserved_instance_ids=grouped_ris.ids,
+                            #     num_reserved_instance=len(grouped_ris),
+                            #     target_configurations=[conf_target_to_dict(tc)
+                            #                            for tc in
+                            #                            grouped_targets]
+                            # )))
+                    except Exception, e:
+                        print "Error", region, type_, e
+                        raise
                 else:
                     print "Skipping...", region, type_
 
