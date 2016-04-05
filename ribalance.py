@@ -2,7 +2,7 @@ import boto3
 import argparse
 
 from pprint import pprint as pp
-from dateutil.tz.tz import tzutc
+from dateutil.tz import tzutc
 from datetime import datetime, timedelta
 from collections import defaultdict as dd
 
