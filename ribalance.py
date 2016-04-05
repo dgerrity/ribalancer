@@ -26,8 +26,9 @@ class IL(object):
             for tag in item.get('Tags', []):
                 if tag.get('Key') == tagname:
                     out.append(tag.get('Value'))
-                else:
-                    out.append(None)
+                    break
+            else:
+                out.append(None)
         return sorted(set(out))
 
     def append(self, item):
