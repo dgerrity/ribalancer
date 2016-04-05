@@ -57,12 +57,11 @@ class IL(object):
         # minutes. Why even have this to begin with?
         o = dd(lambda : IL())
         for ri in self.l:
-            o[self._get_ri_end_time(ri).isoformat()].append(ri)
+            o[self._get_ri_end_time(ri)].append(ri)
         return o
 
     def _get_ri_end_time(self, ri):
-        d = datetime.strptime(ri.start.split(':', 1)[0], "%Y-%m-%dT%H")
-        return d + timedelta(seconds=ri.duration)
+        return datetime.strptime(ri.end.split(':', 1)[0], "%Y-%m-%dT%H").isoformat()
 
     def _get_platform(self, ii_or_ri):
         if hasattr(ii_or_ri, 'description'):
@@ -99,12 +98,7 @@ def should_execute(changes):
         return False
     for platform, zones in changes.iteritems():
         for zone, provision in zones.iteritems():
-            # Typically if there are other fields, they are added in a following
-            # step of the calling function. The actual recommendation is the
-            # first number in the list, and of course if they are all negative
-            # (meaning we should remove RIs) it means there's no point in moving
-            # things, so this checks that there's at least 1 positive value.
-            if provision[0] > 0:
+            if any(p>0 for p in provision):
                 return True
     return False
 
@@ -275,6 +269,7 @@ class RegionalMap(object):
         """
         age_string = age.isoformat().rsplit('.', 1)[0] + ".000Z"
         changes = dd(lambda :dd(lambda: dd(lambda : [])))
+        recs = dd(lambda :dd(lambda: dd(lambda : [])))
         ideal_target = {}
         regional_situation = dd(lambda :dd(lambda: dd(lambda : {})))
         mods = []
@@ -344,7 +339,7 @@ class RegionalMap(object):
                         grouped_ris_and_targets = match_targets(instmap["ri"].group_by_end_hour(), target_configurations)
                         for hour, grouped_ris, grouped_targets in grouped_ris_and_targets:
                             client_token = ".".join([
-                                datetime.utcnow().replace(second=0, microsecond=0).isoformat(),
+                                datetime.utcnow().replace(minute=0, second=0, microsecond=0).isoformat(),
                                 type_,
                                 hour
                             ])
@@ -364,6 +359,8 @@ class RegionalMap(object):
                             # )))
                     except Exception, e:
                         print "Error", region, type_, e
+                        if "Invalid value for 'clientToken'" in e.message:
+                            continue
                         raise
                 else:
                     print "Skipping...", region, type_
@@ -382,11 +379,11 @@ class RegionalMap(object):
             suggested = new_suggested.group_by_zone_and_plat()
             for platform, zones in suggested.iteritems():
                 for zone, insts in zones.iteritems():
-                    changes[type_][platform][zone].append("+R:%s" % len(insts))
-                    changes[type_][platform][zone].append(insts.tags(tag))
+                    recs[type_][platform][zone].append("+R:%s" % len(insts))
+                    recs[type_][platform][zone].append(insts.tags(tag))
 
 
-        return changes, ideal_target, regional_situation, mods
+        return changes, ideal_target, regional_situation, recs, mods
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ribalance will try to allocate your RIs in the most efficient way.',
@@ -400,6 +397,7 @@ if __name__ == "__main__":
                         choices=ec2m.RegionData.keys(), help='Regions to apply this')
     parser.add_argument('--commit', action='store_true', help='Should apply changes') 
     parser.add_argument('--changes', action='store_true', help='Display changes')
+    parser.add_argument('--recs', action='store_true', help='Display recommendations on new RI purchases')
     parser.add_argument('--target', action='store_true', help='Display target')
     parser.add_argument('--state', action='store_true', help='Display state')
     parser.add_argument('--tag', type=str, default="application", help='Name of the tag that splits the different applications')
@@ -411,10 +409,13 @@ if __name__ == "__main__":
     for region in args.regions:
         print "=============  " + region + "  =============="
         rrimap = RegionalMap(region)
-        changes, targets, regional_situation, mods = rrimap.ideal_target(res_age, args.tag, args.commit)
+        changes, targets, regional_situation, recs, mods = rrimap.ideal_target(res_age, args.tag, args.commit)
         if args.changes:
             print "changes"
             pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(changes).items()})
+        if args.recs:
+            print "recs"
+            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(recs).items()})
         if args.target:
             print "targets"
             pp({k: [conf_target_to_dict(i) for i in v] for k, v in targets.items()})
