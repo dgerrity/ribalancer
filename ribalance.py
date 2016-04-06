@@ -11,7 +11,6 @@ class IL(object):
     This object represents an Instance List and it provides a set of
     handy arguments that operate on the list of instances or reserved instances
     that is contained in the list.
-
     This object also tries to simulate the list API, although it's not a real
     list.
     """
@@ -183,10 +182,8 @@ def match_targets(ris, targets):
          end_time2: [ri, ri, ri]}
     targets is a list:
         [tc1, tc2, tc3]
-
     each individual item here underlies more than 1 item. The point here is to
     align each group of reservations with the group of tcs.
-
     Basically we need a list object that supports slicing through this list and
     knows how to generate new objects of a certain kind.
     """
@@ -216,9 +213,10 @@ class RegionalMap(object):
     spots and reserved instances
     """
 
-    def __init__(self, region):
+    def __init__(self, region, profile=None):
         self.instances = dd(lambda: dd(lambda : IL()))
-        self.ec2 = boto3.client('ec2', region)
+        session = boto3.Session(region_name=region, profile_name=profile)
+        self.ec2 = session.client('ec2')
 
         for reserved in self.ec2.describe_reserved_instances().get('ReservedInstances', []):
             if reserved['State'] != "active":
@@ -293,20 +291,15 @@ class RegionalMap(object):
     def ideal_target(self, age, tag):
         """
         This is a relatively simple algorithm.
-
         Count how many RIs are available in a region for a size,
         then sorts instances of that size in the region by start date asc,
         then cuts the list at the number of RIs and gets the zone and count,
         and that would be the recommended layout
-
         For the remainder if we're running an instance for longer than a given
         period of time, it considers the instance a missing RI and suggests the
         purchase.
-
         The return value of the function is a dictionary of
-
         instance_size -> zone -> [net change, new suggested reservations]
-
         if the total result of a region is a negative net change it means that
         there's too many reserved instances.
         """
@@ -403,7 +396,8 @@ if __name__ == "__main__":
 
 
     parser.add_argument('--regions', nargs='*', default=dr, choices=regions, help='Regions to apply this')
-    parser.add_argument('--commit', action='store_true', help='Should apply changes') 
+    parser.add_argument('--profile', help='boto3 profile to use when connecting to AWS')
+    parser.add_argument('--commit', action='store_true', help='Should apply changes')
     parser.add_argument('--changes', action='store_true', help='Display changes')
     parser.add_argument('--recs', action='store_true', help='Display recommendations on new RI purchases')
     parser.add_argument('--target', action='store_true', help='Display target')
@@ -417,7 +411,7 @@ if __name__ == "__main__":
     res_age = res_age.replace(tzinfo=tzutc())
     for region in args.regions:
         print "=============  " + region + "  =============="
-        rrimap = RegionalMap(region)
+        rrimap = RegionalMap(region, args.profile)
         rrimap.ideal_target(res_age, args.tag)
         if args.changes:
             print "changes"
