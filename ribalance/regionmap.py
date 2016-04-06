@@ -1,8 +1,6 @@
 import boto3
-import argparse
 
 from pprint import pprint as pp
-from dateutil.tz import tzutc
 from datetime import datetime, timedelta
 from collections import defaultdict as dd
 
@@ -382,50 +380,3 @@ class RegionalMap(object):
                 for zone, insts in zones.iteritems():
                     recs[type_][platform][zone].append("+R:%s" % len(insts))
                     recs[type_][platform][zone].append(insts.tags(tag))
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='ribalance will try to allocate your RIs in the most efficient way.',
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
-    regions = ['us-east-1', 'cn-north-1', 'ap-northeast-1', 'ap-southeast-2',
-               'sa-east-1', 'ap-southeast-1', 'ap-northeast-2', 'us-west-2',
-               'us-gov-west-1', 'us-west-1', 'eu-central-1', 'eu-west-1']
-    dr = list(regions)
-    dr.remove('cn-north-1')
-    dr.remove('us-gov-west-1')
-
-
-    parser.add_argument('--regions', nargs='*', default=dr, choices=regions, help='Regions to apply this')
-    parser.add_argument('--profile', help='boto3 profile to use when connecting to AWS')
-    parser.add_argument('--commit', action='store_true', help='Should apply changes')
-    parser.add_argument('--changes', action='store_true', help='Display changes')
-    parser.add_argument('--recs', action='store_true', help='Display recommendations on new RI purchases')
-    parser.add_argument('--target', action='store_true', help='Display target')
-    parser.add_argument('--state', action='store_true', help='Display state')
-    parser.add_argument('--tag', type=str, default="application", help='Name of the tag that splits the different applications')
-    parser.add_argument('--age', type=int, default=168, help='Hours since launch to consider sustained (1wk default)')
-
-    args = parser.parse_args()
-
-    res_age = datetime.utcnow() - timedelta(hours=args.age)
-    res_age = res_age.replace(tzinfo=tzutc())
-    for region in args.regions:
-        print "=============  " + region + "  =============="
-        rrimap = RegionalMap(region, args.profile)
-        rrimap.ideal_target(res_age, args.tag)
-        if args.changes:
-            print "changes"
-            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(rrimap.proposed_changes).items()})
-        if args.recs:
-            print "recs"
-            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(rrimap.new_ri_recommendations).items()})
-        if args.target:
-            print "targets"
-            pp(rrimap.target_configurations)
-        if args.state:
-            print "regional breakdown"
-            pp({k: dict({k1: dict(v1) for k1, v1 in v.items()}) for k, v in dict(rrimap.state).items()})
-        if args.commit:
-            print "RI Modifications"
-            pp(rrimap.commit())
-
