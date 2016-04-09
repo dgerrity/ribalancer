@@ -212,6 +212,7 @@ class RegionalMap(object):
     """
 
     def __init__(self, region, profile=None):
+        self.region = region
         self.instances = dd(lambda: dd(lambda : IL()))
         session = boto3.Session(region_name=region, profile_name=profile)
         self.ec2 = session.client('ec2')
@@ -261,12 +262,12 @@ class RegionalMap(object):
                                     )
                         )
                 except Exception, e:
-                    print "Error", region, type_, e
+                    print "Error", self.region, type_, e
                     if "Invalid value for 'clientToken'" in e.message:
                         continue
                     raise
             else:
-                print "Skipping...", region, type_
+                print "Skipping...", self.region, type_
         return mods
 
     @property
@@ -351,7 +352,7 @@ class RegionalMap(object):
 
                     if num_instances+pad <= 0:
                         # Instance count can't be negative or 0.
-                        print "Skipping zero or negative instance count...", region, type_
+                        print "Skipping zero or negative instance count...", self.region, type_
                         continue
 
                     target_configurations.append(dict(
