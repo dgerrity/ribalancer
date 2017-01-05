@@ -3,7 +3,7 @@ import argparse
 from datetime import datetime, timedelta
 
 from dateutil.tz import tzutc
-from ribalance.regionmap import RegionalMap
+from ribalance.regionmap import *
 
 parser = argparse.ArgumentParser(description='ribalance will try to allocate your RIs in the most efficient way.',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
